@@ -25,7 +25,7 @@ void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info){
 
 void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info){
   Serial.println("WiFi connected");
-  Serial.print("\n\nConnected to " + String(ssid));
+  Serial.println("\n\nConnected to; " + String(ssid));
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
 }
@@ -55,6 +55,7 @@ const char* mqtt_password = "your_password";
 
 // Used topics
 const char* light_topic = "lights/rainbow_light";
+const char* light_status_topic = "lights/rainbow_light_status";
 const char* bright_topic = "sensors/rainbow_light/brightness";
 
 WiFiClient espClient;
@@ -94,6 +95,10 @@ unsigned long currentMillis;
 // Update Brightness
 unsigned long lastMillisBright;
 const long intervallBright = 1*60*1000; // How often to update brightness
+
+// Run Animation
+unsigned long lastMillisAnim;
+const long intervallAnim = 15*60*1000; // How often to update animation
 
 //***************************
 //***       LED-Strip     ***
@@ -136,13 +141,13 @@ rgb_colors ring_color[Num_Rings];
 // Init WS2712B object
 Adafruit_NeoPixel WS2812B(Num_Pixels, WS2812B_PIN, NEO_GRB + NEO_KHZ800);
 
-
 void light_rainbow(){
   // Function to light rainbow with an animation
   int pixel_sum = 0;
   int ring = 0;
 
   WS2812B.clear();
+  /*
   for (int element : Pixels_In_Ring){
     
     for (int k = pixel_sum; k<pixel_sum + element; k++){
@@ -154,6 +159,36 @@ void light_rainbow(){
     }
   ring++;
   pixel_sum += element;
+  }
+  */
+ int discrete_steps = 100;
+ double step;
+ int pixel_to_light;
+ int pixels_in_previous_rings;
+ for (int i = 0; i<discrete_steps; i++){
+  for (int j = 0; j<Num_Rings; j++){
+
+    pixels_in_previous_rings = 0;
+    for(int k = 0; k<j;k++){
+      pixels_in_previous_rings = pixels_in_previous_rings + Pixels_In_Ring[k];
+    }
+
+    step = Pixels_In_Ring[j]/(double)discrete_steps;
+
+    pixel_to_light = floor(step * i);
+    
+    // Check if even ring number, then invert counting to start from the right direction
+    if (j % 2 == 0){
+      }
+    else {
+      pixel_to_light = Pixels_In_Ring[j] - pixel_to_light -1;
+    }
+    pixel_to_light = pixel_to_light + pixels_in_previous_rings;
+    WS2812B.setPixelColor(pixel_to_light, WS2812B.Color(ring_color[j].r, ring_color[j].g, ring_color[j].b));
+  }
+  WS2812B.setBrightness(brightness_level);
+  WS2812B.show();
+  delay(50);
 
   }
   light_on = true;
@@ -219,8 +254,8 @@ void get_light_conditions(){
   // Within predefined range
 
   // 5528 Photoresistor togheter with 10kOhm resistor yields
-  // 1200 -> Complete darkness
-  // 2300 -> Dark room
+  // 0 -> Complete darkness
+  // 1500 -> Dark room
   // 3700 -> Lit room
   // 4095 -> Flashlight on photoresistor....
 
@@ -295,11 +330,15 @@ void connect_wifi(){
   if (WiFi.status() == WL_CONNECTED){
     // If succesfully connected
     light_all_one_color(0, 255, 0); // Light all rings green to show success
+    Serial.println("WiFi connected");
+    Serial.println("\n\nConnected to: " + String(ssid));
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
     delay(1000);
   }else{
     // If not connected after time-out
     light_all_one_color(255, 0, 0);
-    Serial.print("\n\nFailed to Connect to " + String(ssid));
+    Serial.println("\n\nFailed to Connect to " + String(ssid));
     delay(5000);
   }
 }
@@ -388,12 +427,31 @@ void loop() {
     client.loop();
   }
 
-  // Adjust brightness once and a while...
   currentMillis = millis();
+
+  // Adjust brightness and report status to MQTT once and a while...
   if(currentMillis - lastMillisBright > intervallBright){
     lastMillisBright = currentMillis;
     //Adjust brightness as needed
     get_light_conditions();
+
+    // Publish status of rainbowlight to MQTT
+    if(light_on){
+      client.publish(light_status_topic, "on");
+    }
+    else {
+      client.publish(light_status_topic, "off");
+    }
+    
+  }
+
+  // Rerun animation
+  if(currentMillis - lastMillisAnim > intervallAnim){
+    lastMillisAnim = currentMillis;
+    //Run light animation i light is on
+    if(light_on){
+      light_rainbow();
+    }
   }
 
 }
