@@ -1,6 +1,8 @@
 # Rainbow Lamp project
+
 This is the code for my Wifi-connected rainbow-lamp project.  
-The hardware is based on an ESP32-C3 super mini and a WS2812B-led strip in a custom designed 3d-printed enclosure in the form of a Rainbow and clouds. 
+The hardware is based on an ESP32-C3 super mini and a WS2812B-led strip in a custom designed 3d-printed enclosure in the form of a Rainbow and clouds.  
+![Rainbow Render](pics/rainbow_render.png)
 
 ## Basic functionality
 - Light Rainbow (doh)
