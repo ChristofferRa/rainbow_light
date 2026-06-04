@@ -1,457 +1,401 @@
+// ESP32-C3 Rainbow Lamp Main Control Code
+// Configured with WiFiManager captive portal (5-minute timeout), ArduinoOTA, Hardware Watchdog,
+// and Home Assistant integration (discrete entities). Removed uptime sensor.
 #include <Arduino.h>
-
-//***************************
-//*** Adaptive Brightness ***
-//***************************
 #include <Wire.h>
-const int light_sensor_pin = 0; // photoresistor sensor pin
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <ArduinoOTA.h>
+#include <ArduinoHA.h>
+#include <esp_task_wdt.h>
+#include <Adafruit_NeoPixel.h>
+#include "SettingsManager.h"
+
+// Watchdog timeout in seconds
+#define WDT_TIMEOUT 10
 
 //***************************
 //***        WiFi         ***
 //***************************
-#include <WiFi.h>
-
-// Shoud wifi be used
-const bool wifi_active = true;
-
-const char* deviceName = "rainbow_lamp";
-const char* ssid = "your_ssid";
-const char* pwd = "your_password";
-
-// Event Handling
-void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("Connected to AP successfully!");
-}
-
-void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("WiFi connected");
-  Serial.println("\n\nConnected to; " + String(ssid));
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("Disconnected from WiFi access point");
-  Serial.print("WiFi lost connection. Reason: ");
-  Serial.println(info.wifi_sta_disconnected.reason);
-  Serial.println("Trying to Reconnect");
-  WiFi.begin(ssid, pwd);
-}
-
-//***************************
-//***       MQTT          ***
-//***************************
-// https://github.com/knolleary/pubsubclient
-#include <PubSubClient.h>
-
-// Should a mqtt-server be used for remote operation
-const bool mqtt_active = true;
-
-// MQTT Broker
-// Server and credentials
-const char* mqtt_server = "your_mqtt_server_address";
-const char* mqtt_user = "your_username";
-const char* mqtt_password = "your_password";
-
-// Used topics
-const char* light_topic = "lights/rainbow_light";
-const char* light_status_topic = "lights/rainbow_light_status";
-const char* bright_topic = "sensors/rainbow_light/brightness";
-
 WiFiClient espClient;
-PubSubClient client(espClient);
-
-// Function to connect to MQTT-server
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.println("Attempting MQTT connection...");
-    // Create client ID
-    String clientId = "rainbow_light";
-    // Attempt to connect
-    if (client.connect(clientId.c_str(), mqtt_user,mqtt_password)) {
-      Serial.println("MTTQ connected");
-      Serial.print("Server: ");
-      Serial.println(mqtt_server);
-      //subscribe
-      client.subscribe(light_topic);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
-}
-
-// Se callback in Set-up section of the code for MQTT-listener
 
 //***************************
-//***    Multitasking     ***
+//***   Home Assistant    ***
 //***************************
-unsigned long currentMillis;
+HADevice device;
+// Using single client class for device-wide subscription list
+HAMqtt mqtt(espClient, device);
 
-// Update Brightness
-unsigned long lastMillisBright;
-const long intervallBright = 1*60*1000; // How often to update brightness
+HASwitch powerSwitch("rainbow_power");
+HANumber brightnessNumber("rainbow_brightness");
+HASwitch autoBrightnessSwitch("rainbow_auto_brightness");
+HASensorNumber lightSensor("rainbow_light_sensor", HASensorNumber::PrecisionP1);
+HASensorNumber rssiSensor("rainbow_rssi", HASensorNumber::PrecisionP0);
+HASelect animationSelect("rainbow_animation");
 
-// Run Animation
-unsigned long lastMillisAnim;
-const long intervallAnim = 15*60*1000; // How often to update animation
+//***************************
+//***      Sensors        ***
+//***************************
+const int light_sensor_pin = 0; // photoresistor sensor pin
 
 //***************************
 //***       LED-Strip     ***
-//***        WS2812B      ***
 //***************************
-// https://github.com/adafruit/Adafruit_NeoPixel/tree/master
-
-#include <Adafruit_NeoPixel.h>
-#define WS2812B_PIN    4   // Pin connected to strip
-
-// Number of rings in rainbow
+#define WS2812B_PIN 4
 const int Num_Rings = 5;
-
-// Define the number of each ring in the rainbow.
-//                     Ring    1   2   3   4   5
 const int Pixels_In_Ring[] = {37, 33, 28, 25, 24};
-
-// Sum of all pixels
-const int Num_Pixels = 37+ 33+ 28+ 25+ 24;
-
-// Brightness
-int brightness_level = 15; // Default Level of brightness of LED:s 1->255
-
-const int max_brightness_allowed = 50; // Maximum allowed brightness to limit current
-const int min_brightness_allowed = 1;
-
-// Light state
-bool light_on = false;
-
-// Define struct with color information of each ring.
-// The colors are set in the setup-function.
-struct rgb_colors {
-    int r;
-    int g;
-    int b;
-};
-
-rgb_colors ring_color[Num_Rings];
-
-// Init WS2712B object
+const int Num_Pixels = 37 + 33 + 28 + 25 + 24;
 Adafruit_NeoPixel WS2812B(Num_Pixels, WS2812B_PIN, NEO_GRB + NEO_KHZ800);
 
-void light_rainbow(){
-  // Function to light rainbow with an animation
-  int pixel_sum = 0;
-  int ring = 0;
+struct rgb_colors {
+  int r, g, b;
+};
+rgb_colors ring_color[Num_Rings];
 
-  WS2812B.clear();
-  /*
-  for (int element : Pixels_In_Ring){
-    
-    for (int k = pixel_sum; k<pixel_sum + element; k++){
-      
-      WS2812B.setPixelColor(k, WS2812B.Color(ring_color[ring].r, ring_color[ring].g, ring_color[ring].b));
+// State
+bool light_on = true;
+int brightness_level = 15;
+bool auto_brightness = true;
+const int max_brightness_allowed = 50;
+const int min_brightness_allowed = 1;
+
+enum AnimationMode {
+  ANIM_NORMAL = 0,
+  ANIM_RAINBOW_CHASE,
+  ANIM_PULSE,
+  ANIM_SPARKLE
+};
+AnimationMode currentAnimation = ANIM_NORMAL;
+unsigned long animationStartTime = 0;
+const unsigned long ANIMATION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+// Forward declarations
+void light_rainbow();
+void light_off();
+void update_leds();
+void run_animation();
+
+// HA Callbacks
+void onPowerCommand(bool state, HASwitch *sender) {
+  light_on = state;
+  sender->setState(state); // Report back
+  if (!light_on) {
+    light_off();
+  } else {
+    update_leds();
+  }
+}
+
+void onBrightnessCommand(HANumeric number, HANumber *sender) {
+  if (!auto_brightness) {
+    brightness_level = number.toInt8();
+    sender->setState(number); // Report back
+    if (light_on)
+      update_leds();
+  }
+}
+
+void onAutoBrightnessCommand(bool state, HASwitch *sender) {
+  auto_brightness = state;
+  sender->setState(state);
+  if (!auto_brightness) {
+    // Report current brightness to the slider
+    brightnessNumber.setCurrentState((int32_t)brightness_level);
+  }
+}
+
+void onAnimationCommand(int8_t index, HASelect *sender) {
+  currentAnimation = (AnimationMode)index;
+  sender->setState(index);
+  animationStartTime = millis();
+  if (light_on) {
+    if (currentAnimation == ANIM_NORMAL) {
+      light_rainbow();
+    }
+  }
+}
+
+void setup_ha() {
+  byte mac[6];
+  WiFi.macAddress(mac);
+  device.setUniqueId(mac, sizeof(mac));
+  device.setName("Rainbow Light");
+  device.setSoftwareVersion("2.0.0");
+  device.setManufacturer("Rapp Industries");
+  device.setModel("Rainbow 1");
+
+  powerSwitch.setName("Power");
+  powerSwitch.setIcon("mdi:power");
+  powerSwitch.onCommand(onPowerCommand);
+
+  brightnessNumber.setName("Brightness");
+  brightnessNumber.setIcon("mdi:brightness-6");
+  brightnessNumber.setMin(min_brightness_allowed);
+  brightnessNumber.setMax(max_brightness_allowed);
+  brightnessNumber.onCommand(onBrightnessCommand);
+
+  autoBrightnessSwitch.setName("Auto Brightness");
+  autoBrightnessSwitch.setIcon("mdi:brightness-auto");
+  autoBrightnessSwitch.onCommand(onAutoBrightnessCommand);
+
+  lightSensor.setName("Light Level");
+  lightSensor.setUnitOfMeasurement("%");
+  // Removed setDeviceClass("illuminance") because % unit of measurement is not
+  // supported by the illuminance device class in HA.
+
+  rssiSensor.setName("Signal Strength");
+  rssiSensor.setUnitOfMeasurement("dBm");
+  rssiSensor.setDeviceClass("signal_strength");
+
+  animationSelect.setName("Animation");
+  animationSelect.setOptions("Normal;Rainbow Chase;Pulse;Sparkle");
+  animationSelect.onCommand(onAnimationCommand);
+
+  mqtt.setBufferSize(1024);
+  mqtt.begin(Settings.mqttServer.c_str(), Settings.mqttUser.c_str(),
+             Settings.mqttPass.c_str());
+}
+
+void get_light_conditions() {
+  int max_light_conditions = 4095;
+  int min_light_conditions = 0;
+  double k = ((double)(max_brightness_allowed - min_brightness_allowed)) /
+             (max_light_conditions - min_light_conditions);
+
+  double adc_val = 0;
+  int nrSamples = 5;
+  for (int i = 0; i < nrSamples; i++) {
+    adc_val += analogRead(light_sensor_pin);
+    delay(50);
+  }
+  adc_val /= nrSamples;
+
+  if (auto_brightness) {
+    brightness_level =
+        k * (adc_val - min_light_conditions) + min_brightness_allowed;
+    brightnessNumber.setCurrentState((int32_t)brightness_level);
+    if (light_on && currentAnimation == ANIM_NORMAL) {
       WS2812B.setBrightness(brightness_level);
       WS2812B.show();
-      delay(100);
     }
-  ring++;
-  pixel_sum += element;
   }
-  */
- int discrete_steps = 100;
- double step;
- int pixel_to_light;
- int pixels_in_previous_rings;
- for (int i = 0; i<discrete_steps; i++){
-  for (int j = 0; j<Num_Rings; j++){
 
+  // Publish sensor % (0-100)
+  float percent = (adc_val / 4095.0) * 100.0;
+  lightSensor.setValue(percent);
+}
+
+void light_rainbow() {
+  int pixel_to_light;
+  int pixels_in_previous_rings;
+  for (int j = 0; j < Num_Rings; j++) {
     pixels_in_previous_rings = 0;
-    for(int k = 0; k<j;k++){
-      pixels_in_previous_rings = pixels_in_previous_rings + Pixels_In_Ring[k];
+    for (int k = 0; k < j; k++) {
+      pixels_in_previous_rings += Pixels_In_Ring[k];
     }
-
-    step = Pixels_In_Ring[j]/(double)discrete_steps;
-
-    pixel_to_light = floor(step * i);
-    
-    // Check if even ring number, then invert counting to start from the right direction
-    if (j % 2 == 0){
-      }
-    else {
-      pixel_to_light = Pixels_In_Ring[j] - pixel_to_light -1;
+    for (int p = 0; p < Pixels_In_Ring[j]; p++) {
+      pixel_to_light = p + pixels_in_previous_rings;
+      WS2812B.setPixelColor(
+          pixel_to_light,
+          WS2812B.Color(ring_color[j].r, ring_color[j].g, ring_color[j].b));
     }
-    pixel_to_light = pixel_to_light + pixels_in_previous_rings;
-    WS2812B.setPixelColor(pixel_to_light, WS2812B.Color(ring_color[j].r, ring_color[j].g, ring_color[j].b));
   }
   WS2812B.setBrightness(brightness_level);
   WS2812B.show();
-  delay(50);
-
-  }
-  light_on = true;
 }
 
-// Function to turn of rainbow light
-void light_off(){
+void light_off() {
   WS2812B.clear();
   WS2812B.show();
-  light_on = false;
 }
 
-
-void connection_animation(){
-  // Function for Wifi-connection animation
-  int pixel_sum = 0;
-  int ring = 0;
-  
-  for (int element : Pixels_In_Ring){
-
-    WS2812B.clear(); // Only light one ring at the same time
-
-    for (int k = pixel_sum; k<pixel_sum + element; k++){
-      
-      WS2812B.setPixelColor(k, WS2812B.Color(255, 115, 0));
-      WS2812B.setBrightness(brightness_level);
-      WS2812B.show();
-      
-    }
-    delay(200);
-
-  ring++;
-  pixel_sum += element;
-
+void update_leds() {
+  if (currentAnimation == ANIM_NORMAL) {
+    light_rainbow();
   }
 }
 
-void light_all_one_color(int r, int g, int b){
-  // Function for lighting all rings with one RGB-color
-  int pixel_sum = 0;
-  int ring = 0;
-  
-  WS2812B.clear();
-  for (int element : Pixels_In_Ring){
-
-    for (int k = pixel_sum; k<pixel_sum + element; k++){
-      
-      WS2812B.setPixelColor(k, WS2812B.Color(r, g, b));
-      WS2812B.setBrightness(brightness_level);
-      WS2812B.show();
-    
-    }
-
-  ring++;
-  pixel_sum += element;
-
+// Simple animations
+void anim_rainbow_chase() {
+  static uint16_t j = 0;
+  for (int i = 0; i < WS2812B.numPixels(); i++) {
+    esp_task_wdt_reset(); // Feed WDT
+    WS2812B.setPixelColor(i, WS2812B.gamma32(WS2812B.ColorHSV(
+                                 (i * 65536L / WS2812B.numPixels()) + j)));
   }
-  
+  WS2812B.setBrightness(brightness_level);
+  WS2812B.show();
+  j += 256;
 }
 
-void get_light_conditions(){
-  // Function for adaptive brightness, adjusts brightness depending on ambient light conditions
-  // Within predefined range
+void anim_pulse() {
+  static int p = 0;
+  static int dir = 1;
 
-  // 5528 Photoresistor togheter with 10kOhm resistor yields
-  // 0 -> Complete darkness
-  // 1500 -> Dark room
-  // 3700 -> Lit room
-  // 4095 -> Flashlight on photoresistor....
+  // Draw base rainbow
+  light_rainbow();
 
-  int max_light_conditions = 4095;
-  int min_light_conditions = 0;
+  // Adjust global brightness based on pulse
+  float factor = (float)p / 100.0;
+  int current_bright = brightness_level * factor;
+  WS2812B.setBrightness(max(1, current_bright));
+  WS2812B.show();
 
-  // Calculate slope of brightness curve
-  double k = ((double)(max_brightness_allowed-min_brightness_allowed))/(max_light_conditions-min_light_conditions);
-
-  // Sample adc 5 times and average to smooth out readings
-  double adc_val = 0;
-  int nrSamples = 5;
-  for (int i=0; i<nrSamples; i++){
-    adc_val = adc_val + analogRead(light_sensor_pin); //Read adc value
-    delay(200);
-  }
-  adc_val = adc_val / nrSamples;
-
-  // Calculate new brightness level
-  brightness_level = k*(adc_val-min_light_conditions)+min_brightness_allowed;
-  Serial.println("New brightness level: " + String(brightness_level) + "/255");
-
-  // If light is on, set new brightness level
-  if(light_on){
-    WS2812B.setBrightness(brightness_level);
-    WS2812B.show();
-  }
-
-  // Publish brightnesslevel to MQTT
-  if(mqtt_active){
-    char tempString[4];
-    dtostrf(adc_val, 1, 2, tempString);
-    client.publish(bright_topic, tempString);
-  }
-
+  p += dir * 2;
+  if (p >= 100)
+    dir = -1;
+  if (p <= 10)
+    dir = 1;
 }
 
-//********************
-//***    Setup     ***
-//********************
-
-void connect_wifi(){
-  // Connect to wifi
-  Serial.print("\nTrying to connect to WiFi: ");
-  Serial.print(ssid);
-  Serial.println("");
-  
-  // Make sure wifi is disconnected before trying to connect.
-  WiFi.disconnect(true);
-
-  // Listen for events
-  WiFi.onEvent(WiFiStationConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
-  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.onEvent(WiFiStationDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-  
-  // Wifi-setup
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); // Workaround for getting wifi working on ESP32-C3
-  WiFi.hostname(deviceName);
-
-  delay(500);
-  // Connect
-  WiFi.begin(ssid, pwd);
-  
-  int timeout_wifi = 0;
-  while (WiFi.status() != WL_CONNECTED && timeout_wifi < 30) {
-    // Wait for connection and show animation
-    Serial.print(".");
-    connection_animation();
-    timeout_wifi++;
-  }
-  if (WiFi.status() == WL_CONNECTED){
-    // If succesfully connected
-    light_all_one_color(0, 255, 0); // Light all rings green to show success
-    Serial.println("WiFi connected");
-    Serial.println("\n\nConnected to: " + String(ssid));
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-    delay(1000);
-  }else{
-    // If not connected after time-out
-    light_all_one_color(255, 0, 0);
-    Serial.println("\n\nFailed to Connect to " + String(ssid));
-    delay(5000);
-  }
+void anim_sparkle() {
+  light_rainbow();
+  int randomPixel = random(WS2812B.numPixels());
+  WS2812B.setPixelColor(randomPixel, WS2812B.Color(255, 255, 255));
+  WS2812B.show();
+  delay(50);
 }
 
-void callback(char* topic, byte* message, unsigned int length) {
-  // Function listening for MQTT Messages
+void run_animation() {
+  if (currentAnimation == ANIM_NORMAL)
+    return;
 
-  Serial.print("Message arrived on topic: " + String(topic) + ". Message: ");
-  String messageTemp;
-  
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)message[i]);
-    messageTemp += (char)message[i];
+  if (millis() - animationStartTime > ANIMATION_TIMEOUT) {
+    currentAnimation = ANIM_NORMAL;
+    animationSelect.setState(ANIM_NORMAL);
+    light_rainbow();
+    return;
   }
-  Serial.println();
 
-  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
-  // Changes the output state according to the message
-  if (String(topic) == light_topic) {
-    Serial.print("Changing output to ");
-    if(messageTemp == "on"){
-      Serial.println("on");
-      light_rainbow();
-    }
-    else if(messageTemp == "off"){
-      Serial.println("off");
-      light_off();
-    }
+  switch (currentAnimation) {
+  case ANIM_RAINBOW_CHASE:
+    anim_rainbow_chase();
+    delay(10);
+    break;
+  case ANIM_PULSE:
+    anim_pulse();
+    delay(20);
+    break;
+  case ANIM_SPARKLE:
+    anim_sparkle();
+    break;
+  default:
+    break;
   }
 }
 
 void setup() {
-  // put your setup code here, to run once:
-  
-  /**************
-   --- Serial ---
-  ***************/
   Serial.begin(115200);
-  Serial.println("Rainbow Light!...");
+  Settings.init();
 
-  /********************
-   --- WS2812b Init ---
-  *********************/
-  // Set ring colors
-  ring_color[0] = {255,  0,  0}; // ring 1, red
-  ring_color[1] = {230, 115, 0}; // ring 2, orange 
-  ring_color[2] = {0,   255, 0}; // ring 3, green
-  ring_color[3] = {0,   0,   255}; // ring 4, blue 
-  ring_color[4] = {179, 0,   179}; // ring 5, violet
+  ring_color[0] = {255, 0, 0};   // ring 1, red
+  ring_color[1] = {230, 115, 0}; // ring 2, orange
+  ring_color[2] = {0, 255, 0};   // ring 3, green
+  ring_color[3] = {0, 0, 255};   // ring 4, blue
+  ring_color[4] = {179, 0, 179}; // ring 5, violet
 
-  WS2812B.begin(); // Init led-strip
+  WS2812B.begin();
+  light_off();
 
-  /*********************
-   --- Connect Wifi ---
-  *********************/
-  // If wifi has been set up, then connect
-  if(wifi_active){
-    connect_wifi();
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // Workaround for getting wifi working
+                                      // stably on ESP32-C3
+
+  WiFiManager wm;
+  WiFiManagerParameter custom_mqtt_server("server", "MQTT Server",
+                                          Settings.mqttServer.c_str(), 40);
+  WiFiManagerParameter custom_mqtt_user("user", "MQTT Username",
+                                        Settings.mqttUser.c_str(), 40);
+  WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Password",
+                                        Settings.mqttPass.c_str(), 40,
+                                        "type=\"password\"");
+
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_user);
+  wm.addParameter(&custom_mqtt_pass);
+
+  // Boot animation
+  WS2812B.setPixelColor(0, WS2812B.Color(255, 115, 0));
+  WS2812B.setBrightness(15);
+  WS2812B.show();
+
+  // Force config portal if MQTT is not configured
+  if (Settings.mqttServer == "") {
+    wm.resetSettings();
   }
-  
-  /*****************
-   --- MQTT Init ---
-  ******************/
- // If MQTT has been set up, then connect
-  if(mqtt_active){
-    client.setServer(mqtt_server, 1883);
-    client.setCallback(callback);
+
+  wm.setConfigPortalTimeout(300); // 5 minute timeout for the portal
+
+  if (!wm.autoConnect("RainbowLamp_Setup")) {
+    Serial.println(
+        "Failed to connect and hit timeout. Continuing without WiFi.");
+  } else {
+    Serial.println("Connected to WiFi!");
+    // Only save credentials if we actually connected via the portal or
+    // successfully booted
+    Settings.saveMqttCredentials(custom_mqtt_server.getValue(),
+                                 custom_mqtt_user.getValue(),
+                                 custom_mqtt_pass.getValue());
   }
 
-  /*********************
-   --- Light Rainbow ---
-  **********************/
-  light_rainbow(); // Always light up on power-on
+  // Hostname
+  String hostname = "RainbowLamp-" + WiFi.macAddress();
+  hostname.replace(":", "");
+  WiFi.setHostname(hostname.c_str());
+
+  // OTA Setup
+  ArduinoOTA.setHostname("rainbow_lamp");
+#ifdef OTA_PASSWORD
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+  ArduinoOTA.onStart([]() {
+    // Remove loopTask from the watchdog during OTA to prevent reboots during
+    // flashing
+    esp_task_wdt_delete(NULL);
+  });
+  ArduinoOTA.begin();
+
+  setup_ha();
+
+  // Get initial light level and adjust brightness immediately
+  get_light_conditions();
+
+  // Init state
+  powerSwitch.setCurrentState(true);
+  autoBrightnessSwitch.setCurrentState(true);
+  brightnessNumber.setCurrentState((int32_t)brightness_level);
+  animationSelect.setCurrentState(ANIM_NORMAL);
+
+  light_rainbow();
+
+  // Initialize Watchdog after WiFi is connected to avoid WDT triggers during
+  // captive portal
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
 }
 
-//*******************
-//***    Loop     ***
-//*******************
 void loop() {
-
-  //Check MQTT-server connection and listen for MQTT-messages
-  if(mqtt_active){
-    if (!client.connected()) {
-      reconnect();
-    }
-    client.loop();
+  esp_task_wdt_reset(); // Feed WDT
+  if (WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.handle();
+    mqtt.loop();
   }
 
-  currentMillis = millis();
-
-  // Adjust brightness and report status to MQTT once and a while...
-  if(currentMillis - lastMillisBright > intervallBright){
-    lastMillisBright = currentMillis;
-    //Adjust brightness as needed
+  static unsigned long lastLightUpdate = 0;
+  if (lastLightUpdate == 0 || millis() - lastLightUpdate > 60000) {
+    lastLightUpdate = millis();
     get_light_conditions();
-
-    // Publish status of rainbowlight to MQTT
-    if(light_on){
-      client.publish(light_status_topic, "on");
-    }
-    else {
-      client.publish(light_status_topic, "off");
-    }
-    
   }
 
-  // Rerun animation
-  if(currentMillis - lastMillisAnim > intervallAnim){
-    lastMillisAnim = currentMillis;
-    //Run light animation i light is on
-    if(light_on){
-      light_rainbow();
+  static unsigned long lastDiagUpdate = 0;
+  if (lastDiagUpdate == 0 || millis() - lastDiagUpdate > 60000) {
+    lastDiagUpdate = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      rssiSensor.setValue(WiFi.RSSI());
     }
   }
 
+  if (light_on) {
+    run_animation();
+  }
 }
